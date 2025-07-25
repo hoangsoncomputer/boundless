@@ -516,25 +516,30 @@ where
                             "Starting preflight of {order_id_clone} with exec limit {exec_limit_cycles} mcycles",
                         );
 
-                        // Upload image and input only if not cached
-                        let image_id = upload_image_uri(&prover, &request, &config)
-                            .await
+                        // Upload image and input in parallel to reduce sequential waiting time
+                        let (image_result, input_result) = tokio::join!(
+                            upload_image_uri(&prover, &request, &config),
+                            upload_input_uri(&prover, &request, &config)
+                        );
+                        
+                        let image_id = image_result
                             .map_err(|e| OrderPickerErr::FetchImageErr(Arc::new(e)))?;
-
-                        let input_id = upload_input_uri(&prover, &request, &config)
-                            .await
+                        let input_id = input_result
                             .map_err(|e| OrderPickerErr::FetchInputErr(Arc::new(e)))?;
 
-                        // TODO add a future timeout here to put a upper bound on how long to preflight for
-                        match prover
-                            .preflight(
+                        // Add timeout to prevent preflight from hanging indefinitely
+                        let preflight_timeout = Duration::from_secs(300); // 5 minutes timeout
+                        match tokio::time::timeout(
+                            preflight_timeout,
+                            prover.preflight(
                                 &image_id,
                                 &input_id,
                                 vec![],
                                 Some(exec_limit_cycles),
                                 &order_id_clone,
                             )
-                            .await
+                        ).await {
+                            Ok(preflight_result) => match preflight_result
                         {
                             Ok(res) => {
                                 tracing::debug!(
@@ -569,6 +574,10 @@ where
                                 }
                                 _ => Err(OrderPickerErr::UnexpectedErr(Arc::new(err.into()))),
                             },
+                            Err(_timeout) => {
+                                tracing::warn!("Preflight timeout for order {order_id_clone} after {} seconds", preflight_timeout.as_secs());
+                                Err(OrderPickerErr::UnexpectedErr(Arc::new(anyhow::anyhow!("Preflight timeout"))))
+                            }
                         }
                     })
                     .await

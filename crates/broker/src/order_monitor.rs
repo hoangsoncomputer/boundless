@@ -224,6 +224,17 @@ where
     async fn lock_order(&self, order: &OrderRequest) -> Result<U256, OrderMonitorErr> {
         let request_id = order.request.id;
 
+        // Quick pre-validation: Check if order is already locked in our local DB first (faster than RPC)
+        let is_locked_locally = self
+            .db
+            .is_request_locked(U256::from(order.request.id))
+            .await
+            .context("Failed to check if request is locked locally")?;
+        if is_locked_locally {
+            tracing::debug!("Request 0x{:x} already locked locally, skipping", request_id);
+            return Err(OrderMonitorErr::AlreadyLocked);
+        }
+
         let order_status = self
             .market
             .get_status(request_id, Some(order.request.expires_at()))
@@ -236,15 +247,7 @@ where
             return Err(OrderMonitorErr::AlreadyLocked);
         }
 
-        let is_locked = self
-            .db
-            .is_request_locked(U256::from(order.request.id))
-            .await
-            .context("Failed to check if request is locked")?;
-        if is_locked {
-            tracing::warn!("Request 0x{:x} already locked: {order_status:?}, skipping", request_id);
-            return Err(OrderMonitorErr::AlreadyLocked);
-        }
+        // DB lock check already done above as pre-validation
 
         let conf_priority_gas = {
             let conf = self.config.lock_all().context("Failed to lock config")?;
@@ -522,8 +525,17 @@ where
     }
 
     async fn lock_and_prove_orders(&self, orders: &[Arc<OrderRequest>]) -> Result<()> {
+        // Process lock operations with controlled concurrency for better throughput
+        let max_concurrent_locks = {
+            let config = self.config.lock_all().context("Failed to read config")?;
+            config.market.max_concurrent_locks as usize
+        };
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_locks));
+        
         let lock_jobs = orders.iter().map(|order| {
+            let semaphore = semaphore.clone();
             async move {
+                let _permit = semaphore.acquire().await.unwrap();
                 let order_id = order.id();
                 if order.fulfillment_type == FulfillmentType::LockAndFulfill {
                     let request_id = order.request.id;
