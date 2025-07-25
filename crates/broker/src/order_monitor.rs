@@ -12,21 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::chain_monitor::ChainHead;
-use crate::OrderRequest;
 use crate::{
     chain_monitor::ChainMonitorService,
     config::{ConfigLock, OrderCommitmentPriority},
-    db::DbObj,
+    db::{DbObj, OrderStatus},
     errors::CodedError,
     impl_coded_debug, now_timestamp,
-    task::{RetryRes, RetryTask, SupervisorErr},
-    utils, FulfillmentType, Order,
+    utils, FulfillmentType, Order, OrderRequest, OrderStateChange,
 };
 use alloy::{
     network::Ethereum,
     primitives::{
-        utils::{format_ether, parse_units},
+        utils::{format_ether, parse_ether},
         Address, U256,
     },
     providers::{Provider, WalletProvider},
@@ -39,8 +36,11 @@ use boundless_market::contracts::{
 };
 use boundless_market::selector::SupportedSelectors;
 use moka::{future::Cache, Expiry};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -196,12 +196,12 @@ where
                     .market
                     .stake_balance_warn_threshold
                     .as_ref()
-                    .map(|s| parse_units(s, stake_token_decimals).unwrap().into()),
+                    .map(|s| parse_ether(s, stake_token_decimals).unwrap().into()),
                 &config
                     .market
                     .stake_balance_error_threshold
                     .as_ref()
-                    .map(|s| parse_units(s, stake_token_decimals).unwrap().into()),
+                    .map(|s| parse_ether(s, stake_token_decimals).unwrap().into()),
             );
         }
         let monitor = Self {
@@ -246,9 +246,30 @@ where
             return Err(OrderMonitorErr::AlreadyLocked);
         }
 
+        // Tối ưu: Dynamic gas priority dựa trên competition level
         let conf_priority_gas = {
             let conf = self.config.lock_all().context("Failed to lock config")?;
-            conf.market.lockin_priority_gas
+            let base_priority = conf.market.lockin_priority_gas.unwrap_or(100);
+            
+            // Tăng priority gas cho orders có deadline ngắn hoặc stake cao
+            let deadline_urgency = if order.request.expires_at() < (now_timestamp() + 300) {
+                200 // Thêm 200 gwei cho orders sắp hết hạn (5 phút)
+            } else if order.request.expires_at() < (now_timestamp() + 600) {
+                100 // Thêm 100 gwei cho orders hết hạn trong 10 phút
+            } else {
+                0
+            };
+            
+            // Tăng priority cho orders có stake cao
+            let stake_bonus = if order.request.offer.lockStake > parse_ether("1").unwrap_or_default() {
+                150 // Thêm 150 gwei cho orders stake > 1 ETH
+            } else if order.request.offer.lockStake > parse_ether("0.1").unwrap_or_default() {
+                50  // Thêm 50 gwei cho orders stake > 0.1 ETH
+            } else {
+                0
+            };
+            
+            Some(base_priority + deadline_urgency + stake_bonus)
         };
 
         tracing::info!(
@@ -522,58 +543,98 @@ where
     }
 
     async fn lock_and_prove_orders(&self, orders: &[Arc<OrderRequest>]) -> Result<()> {
-        let lock_jobs = orders.iter().map(|order| {
-            async move {
-                let order_id = order.id();
-                if order.fulfillment_type == FulfillmentType::LockAndFulfill {
-                    let request_id = order.request.id;
-                    match self.lock_order(order).await {
-                        Ok(lock_price) => {
-                            tracing::info!("Locked request: 0x{:x}", request_id);
-                            if let Err(err) = self.db.insert_accepted_request(order, lock_price).await {
-                                tracing::error!(
-                                    "FATAL STAKE AT RISK: {} failed to move from locking -> proving status {}",
-                                    order_id,
-                                    err
-                                );
-                            }
-                        }
-                        Err(ref err) => {
-                            match err {
-                                OrderMonitorErr::UnexpectedError(inner) => {
+        // Tối ưu: Sử dụng FuturesUnordered để xử lý concurrent tốt hơn
+        use futures::stream::{FuturesUnordered, StreamExt};
+        
+        let mut lock_tasks = FuturesUnordered::new();
+        
+        // Giới hạn số lượng concurrent locks để tránh overwhelm
+        let max_concurrent = 12; // Có thể config từ defaults::max_concurrent_locks()
+        let chunks = orders.chunks(max_concurrent);
+        
+        for chunk in chunks {
+            let chunk_tasks = chunk.iter().map(|order| {
+                let order = order.clone();
+                let db = self.db.clone();
+                let lock_and_prove_cache = self.lock_and_prove_cache.clone();
+                let prove_cache = self.prove_cache.clone();
+                
+                async move {
+                    let order_id = order.id();
+                    if order.fulfillment_type == FulfillmentType::LockAndFulfill {
+                        let request_id = order.request.id;
+                        
+                        // Tối ưu: Thêm timeout cho lock operation
+                        let lock_future = self.lock_order(&order);
+                        let timeout_duration = Duration::from_secs(30); // 30s timeout
+                        
+                        match tokio::time::timeout(timeout_duration, lock_future).await {
+                            Ok(Ok(lock_price)) => {
+                                tracing::info!("Locked request: 0x{:x}", request_id);
+                                if let Err(err) = db.insert_accepted_request(&order, lock_price).await {
                                     tracing::error!(
-                                        "Failed to lock order: {order_id} - {} - {inner:?}",
-                                        err.code()
-                                    );
-                                }
-                                _ => {
-                                    tracing::warn!(
-                                        "Soft failed to lock request: {order_id} - {} - {err:?}",
-                                        err.code()
+                                        "FATAL STAKE AT RISK: {} failed to move from locking -> proving status {}",
+                                        order_id,
+                                        err
                                     );
                                 }
                             }
-                            if let Err(err) = self.db.insert_skipped_request(order).await {
-                                tracing::error!(
-                                    "Failed to set DB failure state for order: {order_id} - {err:?}"
-                                );
+                            Ok(Err(ref err)) => {
+                                match err {
+                                    OrderMonitorErr::UnexpectedError(inner) => {
+                                        tracing::error!(
+                                            "Failed to lock order: {order_id} - {} - {inner:?}",
+                                            err.code()
+                                        );
+                                    }
+                                    _ => {
+                                        tracing::warn!(
+                                            "Soft failed to lock request: {order_id} - {} - {err:?}",
+                                            err.code()
+                                        );
+                                    }
+                                }
+                                if let Err(err) = db.insert_skipped_request(&order).await {
+                                    tracing::error!(
+                                        "Failed to set DB failure state for order: {order_id} - {err:?}"
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                tracing::warn!("Lock operation timed out for order: {order_id}");
+                                if let Err(err) = db.insert_skipped_request(&order).await {
+                                    tracing::error!(
+                                        "Failed to set DB timeout state for order: {order_id} - {err:?}"
+                                    );
+                                }
                             }
                         }
+                        lock_and_prove_cache.invalidate(&order_id).await;
+                    } else {
+                        if let Err(err) = db.insert_accepted_request(&order, U256::ZERO).await {
+                            tracing::error!(
+                                "Failed to set order status to pending proving: {} - {err:?}",
+                                order_id
+                            );
+                        }
+                        prove_cache.invalidate(&order_id).await;
                     }
-                    self.lock_and_prove_cache.invalidate(&order_id).await;
-                } else {
-                    if let Err(err) = self.db.insert_accepted_request(order, U256::ZERO).await {
-                        tracing::error!(
-                            "Failed to set order status to pending proving: {} - {err:?}",
-                            order_id
-                        );
-                    }
-                    self.prove_cache.invalidate(&order_id).await;
                 }
+            });
+            
+            // Xử lý chunk hiện tại trước khi chuyển sang chunk tiếp theo
+            for task in chunk_tasks {
+                lock_tasks.push(task);
             }
-        });
-
-        futures::future::join_all(lock_jobs).await;
+            
+            // Chờ một số tasks hoàn thành trước khi thêm tasks mới
+            while lock_tasks.len() >= max_concurrent {
+                lock_tasks.next().await;
+            }
+        }
+        
+        // Chờ tất cả remaining tasks hoàn thành
+        while lock_tasks.next().await.is_some() {}
 
         Ok(())
     }
@@ -1101,7 +1162,7 @@ pub(crate) mod tests {
         // Using 10 ETH to ensure plenty of funds for tests
         let stake_token_decimals = market_service.stake_token_decimals().await.unwrap();
         market_service
-            .deposit(parse_units("10.0", stake_token_decimals).unwrap().into())
+            .deposit(parse_ether("10.0", stake_token_decimals).unwrap().into())
             .await
             .unwrap();
 
