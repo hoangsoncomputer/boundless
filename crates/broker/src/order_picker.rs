@@ -59,14 +59,14 @@ const MIN_CAPACITY_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const ONE_MILLION: U256 = uint!(1_000_000_U256);
 
 /// Maximum number of orders to cache for deduplication
-const ORDER_DEDUP_CACHE_SIZE: u64 = 5000;
+const ORDER_DEDUP_CACHE_SIZE: u64 = 50000;  // Increased from 5000 to 50000
 
 /// In-memory LRU cache for order deduplication by ID (prevents duplicate order processing)
 type OrderCache = Arc<Cache<String, ()>>;
 
 /// Configuration for preflight result caching
-const PREFLIGHT_CACHE_SIZE: u64 = 5000;
-const PREFLIGHT_CACHE_TTL_SECS: u64 = 3 * 60 * 60; // 3 hours
+const PREFLIGHT_CACHE_SIZE: u64 = 100000;           // Increased from 5000 to 100000
+const PREFLIGHT_CACHE_TTL_SECS: u64 = 24 * 60 * 60; // Increased from 3 hours to 24 hours
 
 /// Cache for preflight results to avoid duplicate computations
 type PreflightCache = Arc<Cache<PreflightCacheKey, PreflightCacheValue>>;
