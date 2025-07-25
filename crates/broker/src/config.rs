@@ -77,6 +77,10 @@ mod defaults {
     pub const fn max_concurrent_preflights() -> u32 {
         4
     }
+
+    pub const fn max_concurrent_locks() -> u32 {
+        8
+    }
 }
 
 /// Order pricing priority mode for determining which orders to price first
@@ -236,6 +240,9 @@ pub struct MarketConf {
     /// Used to limit pricing tasks spawned to prevent overwhelming the system
     #[serde(default = "defaults::max_concurrent_preflights")]
     pub max_concurrent_preflights: u32,
+    /// Maximum number of concurrent lock operations
+    #[serde(default = "defaults::max_concurrent_locks")]
+    pub max_concurrent_locks: u32,
     /// Order pricing priority mode
     ///
     /// Determines how orders are prioritized for pricing. Options:
@@ -284,6 +291,7 @@ impl Default for MarketConf {
             max_concurrent_proofs: None,
             cache_dir: None,
             max_concurrent_preflights: defaults::max_concurrent_preflights(),
+        max_concurrent_locks: defaults::max_concurrent_locks(),
             order_pricing_priority: OrderPricingPriority::default(),
             order_commitment_priority: OrderCommitmentPriority::default(),
         }
