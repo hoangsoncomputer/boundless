@@ -38,11 +38,11 @@ use boundless_market::selector::SupportedSelectors;
 use moka::{future::Cache, Expiry};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, atomic::{AtomicU32, AtomicU64, Ordering}},
+    time::{Duration, Instant},
 };
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore}; // Thêm Semaphore
 use tokio_util::sync::CancellationToken;
 
 /// Hard limit on the number of orders to concurrently kick off proving work for.
@@ -142,6 +142,53 @@ pub struct RpcRetryConfig {
     pub retry_sleep_ms: u64,
 }
 
+// Thêm struct cho Circuit Breaker
+#[derive(Debug)]
+pub struct CircuitBreaker {
+    failure_count: AtomicU32,
+    last_failure_time: AtomicU64,
+    failure_threshold: u32,
+    recovery_timeout: Duration,
+}
+
+impl CircuitBreaker {
+    pub fn new(failure_threshold: u32, recovery_timeout: Duration) -> Self {
+        Self {
+            failure_count: AtomicU32::new(0),
+            last_failure_time: AtomicU64::new(0),
+            failure_threshold,
+            recovery_timeout,
+        }
+    }
+    
+    pub fn can_execute(&self) -> bool {
+        let failures = self.failure_count.load(Ordering::Relaxed);
+        if failures < self.failure_threshold {
+            return true;
+        }
+        
+        let last_failure = self.last_failure_time.load(Ordering::Relaxed);
+        let now = Instant::now().elapsed().as_secs();
+        
+        if now - last_failure > self.recovery_timeout.as_secs() {
+            // Reset circuit breaker
+            self.failure_count.store(0, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+    
+    pub fn record_success(&self) {
+        self.failure_count.store(0, Ordering::Relaxed);
+    }
+    
+    pub fn record_failure(&self) {
+        self.failure_count.fetch_add(1, Ordering::Relaxed);
+        self.last_failure_time.store(Instant::now().elapsed().as_secs(), Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 pub struct OrderMonitor<P> {
     db: DbObj,
@@ -156,6 +203,12 @@ pub struct OrderMonitor<P> {
     prove_cache: Arc<Cache<String, Arc<OrderRequest>>>,
     supported_selectors: SupportedSelectors,
     rpc_retry_config: RpcRetryConfig,
+    // Thêm circuit breaker cho lock operations
+    pub lock_circuit_breaker: Arc<CircuitBreaker>,
+    // Thêm memory pool cho orders
+    pub order_pool: Arc<Mutex<Vec<OrderRequest>>>,
+    // Thêm semaphore để control concurrent locks
+    pub lock_semaphore: Arc<Semaphore>,
 }
 
 impl<P> OrderMonitor<P>
@@ -217,6 +270,12 @@ where
             prove_cache: Arc::new(Cache::builder().expire_after(OrderExpiry).build()),
             supported_selectors: SupportedSelectors::default(),
             rpc_retry_config,
+            // Thêm circuit breaker cho lock operations
+            lock_circuit_breaker: Arc::new(CircuitBreaker::new(3, Duration::from_secs(10))),
+            // Thêm memory pool cho orders
+            order_pool: Arc::new(Mutex::new(Vec::new())),
+            // Thêm semaphore để control concurrent locks
+            lock_semaphore: Arc::new(Semaphore::new(12)),
         };
         Ok(monitor)
     }
@@ -639,6 +698,63 @@ where
         Ok(())
     }
 
+    // Thêm function mới để batch lock orders
+    async fn batch_lock_orders(&self, orders: &[Arc<OrderRequest>]) -> Result<Vec<(Arc<OrderRequest>, Result<U256, OrderMonitorErr>)>> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        
+        let mut batch_futures = FuturesUnordered::new();
+        
+        // Tạo batch requests với optimized gas
+        for order in orders.iter().take(8) { // Limit to 8 concurrent locks
+            let order_clone = order.clone();
+            let market_clone = self.market.clone();
+            let config_clone = self.config.clone();
+            
+            let future = async move {
+                // Pre-check để tránh unnecessary RPC calls
+                let request_id = order_clone.request.id;
+                
+                // Optimized gas calculation
+                let dynamic_gas = {
+                    let conf = config_clone.lock_all().map_err(|_| OrderMonitorErr::UnexpectedError(Arc::new(anyhow::anyhow!("Config lock failed"))))?;
+                    let base_gas = conf.market.lockin_priority_gas.unwrap_or(100);
+                    
+                    // Fast urgency calculation
+                    let urgency_bonus = if order_clone.request.expires_at() < (now_timestamp() + 300) {
+                        300 // Higher bonus for very urgent orders
+                    } else {
+                        100
+                    };
+                    
+                    Some(base_gas + urgency_bonus)
+                };
+                
+                // Execute lock with timeout
+                let lock_result = tokio::time::timeout(
+                    Duration::from_secs(20), // Shorter timeout for batch
+                    market_clone.lock_request(&order_clone.request, order_clone.client_sig.clone(), dynamic_gas)
+                ).await;
+                
+                let result = match lock_result {
+                    Ok(Ok(lock_block)) => Ok(U256::from(lock_block)),
+                    Ok(Err(e)) => Err(OrderMonitorErr::LockTxFailed(e.to_string())),
+                    Err(_) => Err(OrderMonitorErr::LockTxNotConfirmed("Timeout".to_string())),
+                };
+                
+                (order_clone, result)
+            };
+            
+            batch_futures.push(future);
+        }
+        
+        let mut results = Vec::new();
+        while let Some(result) = batch_futures.next().await {
+            results.push(result);
+        }
+        
+        Ok(results)
+    }
+
     /// Calculate the gas units needed for an order and the corresponding cost in wei
     async fn calculate_order_gas_cost_wei(
         &self,
@@ -883,6 +999,66 @@ where
         Ok(final_orders)
     }
 
+    // Thêm function để pre-filter orders thông minh
+    async fn smart_filter_orders(&self, orders: &[Arc<OrderRequest>]) -> Result<Vec<Arc<OrderRequest>>> {
+        let mut filtered_orders = Vec::new();
+        let current_time = now_timestamp();
+        
+        // Parallel pre-checks để filter nhanh
+        let pre_check_futures: Vec<_> = orders.iter().map(|order| {
+            let order = order.clone();
+            let market = self.market.clone();
+            
+            async move {
+                // Quick profitability check
+                let is_profitable = order.request.offer.lockStake > parse_ether("0.01").unwrap_or_default();
+                
+                // Quick deadline check
+                let has_enough_time = order.request.expires_at() > (current_time + 120); // 2 phút buffer
+                
+                // Quick stake check
+                let reasonable_stake = order.request.offer.lockStake < parse_ether("100").unwrap_or_default();
+                
+                // Skip expensive RPC call if basic checks fail
+                if !is_profitable || !has_enough_time || !reasonable_stake {
+                    return (order, false);
+                }
+                
+                // Only do expensive check for promising orders
+                match tokio::time::timeout(Duration::from_secs(2), market.get_status(order.request.id, Some(order.request.expires_at()))).await {
+                    Ok(Ok(status)) => (order, status == RequestStatus::Unknown),
+                    _ => (order, false), // Assume locked/failed if can't check quickly
+                }
+            }
+        }).collect();
+        
+        // Process pre-checks in parallel
+        let pre_check_results = futures::future::join_all(pre_check_futures).await;
+        
+        // Collect only promising orders
+        for (order, is_valid) in pre_check_results {
+            if is_valid {
+                filtered_orders.push(order);
+            }
+        }
+        
+        // Sort by priority: deadline urgency + profitability
+        filtered_orders.sort_by(|a, b| {
+            let a_urgency = current_time.saturating_sub(a.request.expires_at());
+            let b_urgency = current_time.saturating_sub(b.request.expires_at());
+            let a_profit = a.request.offer.lockStake;
+            let b_profit = b.request.offer.lockStake;
+            
+            // Combine urgency and profitability scores
+            let a_score = a_urgency * 1000 + a_profit.to::<u64>();
+            let b_score = b_urgency * 1000 + b_profit.to::<u64>();
+            
+            b_score.cmp(&a_score) // Descending order
+        });
+        
+        Ok(filtered_orders)
+    }
+
     pub async fn start_monitor(
         self,
         cancel_token: CancellationToken,
@@ -995,6 +1171,57 @@ where
             }
         }
         Ok(())
+    }
+
+    // Thêm function để xử lý high priority orders nhanh
+    async fn fast_track_high_priority_orders(&self, orders: &[Arc<OrderRequest>]) -> Result<(Vec<Arc<OrderRequest>>, Vec<Arc<OrderRequest>>)> {
+        let mut high_priority = Vec::new();
+        let mut normal_priority = Vec::new();
+        let current_time = now_timestamp();
+        
+        for order in orders {
+            let is_high_priority = 
+                // Very urgent (< 5 minutes)
+                order.request.expires_at() < (current_time + 300) ||
+                // High stake (> 1 ETH)
+                order.request.offer.lockStake > parse_ether("1").unwrap_or_default() ||
+                // Priority requestor (if configured)
+                self.is_priority_requestor(&order.request.requestor);
+            
+            if is_high_priority {
+                high_priority.push(order.clone());
+            } else {
+                normal_priority.push(order.clone());
+            }
+        }
+        
+        // Sort high priority by urgency + stake
+        high_priority.sort_by(|a, b| {
+            let a_score = self.calculate_priority_score(a);
+            let b_score = self.calculate_priority_score(b);
+            b_score.partial_cmp(&a_score).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        
+        Ok((high_priority, normal_priority))
+    }
+    
+    fn calculate_priority_score(&self, order: &OrderRequest) -> f64 {
+        let current_time = now_timestamp();
+        let time_urgency = (current_time + 3600).saturating_sub(order.request.expires_at()) as f64;
+        let stake_value = order.request.offer.lockStake.to::<f64>();
+        
+        // Weighted score: 70% urgency, 30% stake value
+        (time_urgency * 0.7) + (stake_value * 0.3)
+    }
+    
+    fn is_priority_requestor(&self, requestor: &Address) -> bool {
+        // Check if requestor is in priority list (from config)
+        if let Ok(config) = self.config.lock_all() {
+            if let Some(priority_addresses) = &config.market.priority_requestor_addresses {
+                return priority_addresses.contains(requestor);
+            }
+        }
+        false
     }
 }
 

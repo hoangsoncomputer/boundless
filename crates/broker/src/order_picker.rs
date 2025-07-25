@@ -59,17 +59,22 @@ const MIN_CAPACITY_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const ONE_MILLION: U256 = uint!(1_000_000_U256);
 
 /// Maximum number of orders to cache for deduplication
-const ORDER_DEDUP_CACHE_SIZE: u64 = 5000;
+const ORDER_DEDUP_CACHE_SIZE: u64 = 15000;
 
 /// In-memory LRU cache for order deduplication by ID (prevents duplicate order processing)
 type OrderCache = Arc<Cache<String, ()>>;
 
 /// Configuration for preflight result caching
-const PREFLIGHT_CACHE_SIZE: u64 = 5000;
-const PREFLIGHT_CACHE_TTL_SECS: u64 = 3 * 60 * 60; // 3 hours
+const PREFLIGHT_CACHE_SIZE: u64 = 20000;
+const PREFLIGHT_CACHE_TTL_SECS: u64 = 6 * 60 * 60; // 6 hours
 
 /// Cache for preflight results to avoid duplicate computations
 type PreflightCache = Arc<Cache<PreflightCacheKey, PreflightCacheValue>>;
+
+// Thêm cache mới cho gas estimates
+const GAS_ESTIMATE_CACHE_SIZE: u64 = 10000;
+const GAS_ESTIMATE_CACHE_TTL_SECS: u64 = 30 * 60; // 30 minutes
+type GasEstimateCache = Arc<Cache<String, u64>>;
 
 #[derive(Error, Debug, Clone)]
 #[non_exhaustive]
