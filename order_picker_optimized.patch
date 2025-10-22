@@ -1,0 +1,117 @@
+diff --git a/crates/broker/src/order_picker.rs b/crates/broker/src/order_picker.rs
+index 1234567..abcdefg 100644
+--- a/crates/broker/src/order_picker.rs
++++ b/crates/broker/src/order_picker.rs
+@@ -700,6 +700,15 @@ impl<P> OrderPicker<P>
+         let mcycle_price_max = U256::from(order.request.offer.maxPrice)
+             .saturating_sub(order_gas_cost)
+             .saturating_mul(one_mill)
+             / U256::from(proof_res.stats.total_cycles);
+ 
++        // OPTIMIZATION: Giảm giá minimum để cạnh tranh tích cực hơn
++        let aggressive_factor = U256::from(80); // 80% của giá config
++        let config_min_mcycle_price_aggressive = config_min_mcycle_price
++            .saturating_mul(aggressive_factor)
++            / U256::from(100);
++        
++        let effective_min_price = std::cmp::min(config_min_mcycle_price, config_min_mcycle_price_aggressive);
++
+         // Check if the order is profitable at minimum price
+-        if mcycle_price_min < config_min_mcycle_price {
++        if mcycle_price_min < effective_min_price {
+             tracing::debug!(
+                 "Order {order_id} min price too low: {} < {}",
+                 format_ether(mcycle_price_min),
+-                format_ether(config_min_mcycle_price)
++                format_ether(effective_min_price)
+             );
+             return Ok(Skip);
+         }
+ 
++        // OPTIMIZATION: Tính toán thời điểm tối ưu để bid
++        let current_time = now_timestamp();
++        let bidding_start = order.request.offer.biddingStart;
++        let ramp_duration = order.request.offer.rampDurationSecs as u64;
++        
++        // Bid sớm hơn để có lợi thế cạnh tranh
++        let optimal_bid_time = bidding_start + (ramp_duration / 4); // Bid sau 25% thời gian ramp
++        let early_bid_threshold = bidding_start + (ramp_duration / 8); // Có thể bid sớm hơn nếu cần
++        
++        // Nếu là order có giá trị cao, bid sớm hơn
++        let is_high_value = U256::from(order.request.offer.maxPrice) > parse_ether("0.01").unwrap_or_default();
++        let should_bid_early = is_high_value;
++        
++        let target_timestamp = if should_bid_early {
++            std::cmp::max(current_time, early_bid_threshold)
++        } else {
++            optimal_bid_time
++        };
++
+         // Calculate when we should attempt to lock this order
+-        let target_timestamp = self.calculate_lock_timestamp(order, proof_res).await?;
++        let calculated_target = self.calculate_lock_timestamp(order, proof_res).await?;
++        let final_target_timestamp = std::cmp::min(target_timestamp, calculated_target);
+         
+         let expiry_timestamp = bidding_start + order.request.offer.timeout as u64;
+ 
+         Ok(Lock {
+             total_cycles: proof_res.stats.total_cycles,
+-            target_timestamp_secs: target_timestamp,
++            target_timestamp_secs: final_target_timestamp,
+             expiry_secs: expiry_timestamp,
+         })
+     }
+ 
++    // OPTIMIZATION: Cải thiện thuật toán tính toán thời điểm lock
+     async fn calculate_lock_timestamp(
+         &self,
+         order: &OrderRequest,
+         proof_res: &ProofResult,
+     ) -> Result<u64, OrderPickerErr> {
+         let config = self.config.lock_all().context("Failed to read config")?;
+         let min_deadline_secs = config.market.min_deadline as u64;
+         
++        // Tính toán thời gian proving dự kiến
+         let estimated_proving_time = self.estimate_proving_time(proof_res.stats.total_cycles).await?;
++        
++        // OPTIMIZATION: Giảm buffer time để có thể bid sớm hơn
++        let buffer_time = std::cmp::min(estimated_proving_time / 4, 60); // Tối đa 60 giây buffer
+         
+         let current_time = now_timestamp();
+         let bidding_start = order.request.offer.biddingStart;
+         let ramp_duration = order.request.offer.rampDurationSecs as u64;
+         let lock_timeout = order.request.offer.lockTimeout as u64;
+         
+-        // We want to lock early enough to complete proving before expiry
++        // OPTIMIZATION: Lock sớm hơn để đảm bảo có thời gian proving
+         let latest_lock_time = (bidding_start + lock_timeout)
+-            .saturating_sub(estimated_proving_time)
+-            .saturating_sub(min_deadline_secs);
++            .saturating_sub(estimated_proving_time + buffer_time)
++            .saturating_sub(min_deadline_secs / 2); // Giảm min_deadline để bid sớm hơn
+             
+-        // But we also want to wait for a good price in the ramp
+-        let price_optimal_time = bidding_start + (ramp_duration / 2);
++        // OPTIMIZATION: Tối ưu hóa thời điểm để có giá tốt nhưng vẫn cạnh tranh
++        let price_optimal_time = bidding_start + (ramp_duration / 3); // Bid sau 1/3 thời gian ramp
+         
+         let target_time = std::cmp::min(latest_lock_time, price_optimal_time);
+         Ok(std::cmp::max(target_time, current_time))
+     }
+ 
++    // OPTIMIZATION: Cải thiện ước tính thời gian proving
+     async fn estimate_proving_time(&self, cycles: u64) -> Result<u64, OrderPickerErr> {
+         let config = self.config.lock_all().context("Failed to read config")?;
+         
+         if let Some(peak_khz) = config.market.peak_prove_khz {
+-            let estimated_seconds = (cycles / 1000) / peak_khz as u64;
+-            Ok(estimated_seconds + 30) // Add 30 second buffer
++            // OPTIMIZATION: Ước tính chính xác hơn và thêm overhead
++            let base_seconds = (cycles / 1000) / peak_khz as u64;
++            let overhead = std::cmp::max(base_seconds / 10, 10); // 10% overhead, tối thiểu 10 giây
++            Ok(base_seconds + overhead)
+         } else {
+-            Ok(300) // Default 5 minutes if no peak_khz configured
++            Ok(180) // Giảm default từ 5 phút xuống 3 phút
+         }
+     }

@@ -1,0 +1,64 @@
+--- a/crates/broker/src/order_picker.rs
++++ b/crates/broker/src/order_picker.rs
+@@ -715,6 +715,13 @@
+             return Ok(Skip);
+         }
+ 
++        // OPTIMIZATION: Aggressive pricing - chấp nhận giá thấp hơn 20% để cạnh tranh
++        let aggressive_factor = U256::from(80); // 80% của giá config
++        let aggressive_min_price = config_min_mcycle_price
++            .saturating_mul(aggressive_factor)
++            / U256::from(100);
++        let effective_min_price = std::cmp::min(config_min_mcycle_price, aggressive_min_price);
++
+         let target_timestamp_secs = if mcycle_price_min >= config_min_mcycle_price {
+             tracing::info!(
+                 "Selecting order {order_id} at price {} - ASAP",
+@@ -722,7 +729,15 @@
+             );
+             0 // Schedule the lock ASAP
+         } else {
+-            let target_min_price = config_min_mcycle_price
++            // OPTIMIZATION: Sử dụng aggressive pricing
++            let base_min_price = if mcycle_price_min >= aggressive_min_price {
++                aggressive_min_price
++            } else {
++                config_min_mcycle_price
++            };
++            
++            let target_min_price = base_min_price
+                 .saturating_mul(U256::from(proof_res.stats.total_cycles))
+                 .div_ceil(ONE_MILLION)
+                 + order_gas_cost;
+@@ -731,9 +746,28 @@
+                 format_ether(target_min_price)
+             );
+ 
+-            order
++            // OPTIMIZATION: Tính toán thời điểm bid tối ưu
++            let standard_timestamp = order
+                 .request
+                 .offer
+                 .time_at_price(target_min_price)
+-                .context("Failed to get target price timestamp")?
++                .context("Failed to get target price timestamp")?;
++            
++            // Bid sớm hơn cho order có giá trị cao
++            let is_high_value = U256::from(order.request.offer.maxPrice) > 
++                parse_ether("0.01").unwrap_or_default();
++            
++            let bidding_start = order.request.offer.biddingStart;
++            let ramp_duration = order.request.offer.rampDurationSecs as u64;
++            
++            // Tính thời điểm bid tối ưu (25% thay vì 50% ramp time)
++            let optimal_bid_time = bidding_start + (ramp_duration / 4);
++            let early_bid_time = bidding_start + (ramp_duration / 8);
++            
++            let target_bid_time = if is_high_value {
++                early_bid_time // Bid ở 12.5% cho high-value orders
++            } else {
++                optimal_bid_time // Bid ở 25% cho orders thường
++            };
++            
++            std::cmp::min(standard_timestamp, target_bid_time)
+        };

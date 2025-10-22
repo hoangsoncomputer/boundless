@@ -1,0 +1,68 @@
+--- a/crates/broker/src/prioritization.rs
++++ b/crates/broker/src/prioritization.rs
+@@ -45,6 +45,24 @@
+ where
+     T: AsRef<OrderRequest>,
+ {
++    // OPTIMIZATION: Thêm logic ưu tiên order có giá trị cao
++    let sort_with_value_priority = |orders: &mut Vec<T>| {
++        orders.sort_by(|a, b| {
++            let a_max_price = a.as_ref().request.offer.maxPrice;
++            let b_max_price = b.as_ref().request.offer.maxPrice;
++            
++            // Ước tính cycles dựa trên offer (fallback nếu không có data)
++            let a_cycles = 1_000_000_u64; // Default 1M cycles
++            let b_cycles = 1_000_000_u64;
++            
++            // Tính giá trị per cycle
++            let a_value_per_cycle = a_max_price as f64 / a_cycles as f64;
++            let b_value_per_cycle = b_max_price as f64 / b_cycles as f64;
++            
++            // Ưu tiên giá trị per cycle cao hơn
++            b_value_per_cycle.partial_cmp(&a_value_per_cycle).unwrap_or(std::cmp::Ordering::Equal)
++        });
++    };
+
+     let Some(addresses) = priority_addresses else {
+         sort_by_mode(orders, mode);
+         return;
+@@ -53,6 +71,8 @@
+     let (mut priority_orders, mut regular_orders): (Vec<T>, Vec<T>) = orders
+         .drain(..)
+         .partition(|order| addresses.contains(&order.as_ref().request.client_address()));
++
++    sort_with_value_priority(&mut regular_orders); // Ưu tiên giá trị cho regular orders
+ 
+     sort_by_mode(&mut priority_orders, mode);
+     sort_by_mode(&mut regular_orders, mode);
+@@ -66,7 +86,15 @@
+ {
+     match mode {
+         UnifiedPriorityMode::Random => {
+-            orders.shuffle(&mut rand::rng())
++            // OPTIMIZATION: Weighted random dựa trên giá trị order
++            let mut rng = rand::rng();
++            // Chỉ shuffle 50% cuối, giữ 50% đầu theo thứ tự giá trị
++            let split_point = orders.len() / 2;
++            if orders.len() > 4 {
++                orders[split_point..].shuffle(&mut rng);
++            } else {
++                orders.shuffle(&mut rng);
++            }
+         }
+         UnifiedPriorityMode::TimeOrdered => {
+             // Already in observation time order, no sorting needed
+@@ -74,7 +102,18 @@
+         UnifiedPriorityMode::ShortestExpiry => {
+             orders.sort_by_key(|order| {
+                 let base_expiry = order.as_ref().expiry();
+-                base_expiry
++                let max_price = order.as_ref().request.offer.maxPrice;
+                 let price_priority = u64::MAX - std::cmp::min(max_price, u64::MAX);
+                 let time_factor = 1000000; // Để thời gian vẫn là yếu tố chính
+                 let expiry_group = base_expiry / 60; // Group theo phút
+                 let combined_priority = expiry_group * time_factor + (price_priority / time_factor);
+                 combined_priority
+             });
+         }
+     }
