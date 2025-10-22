@@ -28,6 +28,10 @@ enum UnifiedPriorityMode {
     Random,
     TimeOrdered,
     ShortestExpiry,
+    // Thêm mode mới: Ưu tiên theo profitability và urgency
+    ProfitabilityFirst,
+    // Thêm mode mới: Hybrid strategy
+    SmartHybrid,
 }
 
 impl From<OrderPricingPriority> for UnifiedPriorityMode {

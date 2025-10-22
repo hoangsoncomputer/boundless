@@ -21,6 +21,14 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions},
     Row,
 };
+
+// Thêm constants cho database optimization
+const DB_MAX_CONNECTIONS: u32 = 50;        // Tăng từ default 10
+const DB_MIN_CONNECTIONS: u32 = 10;        // Maintain minimum connections
+const DB_ACQUIRE_TIMEOUT_SECS: u64 = 5;    // Fast timeout để fail fast
+const DB_IDLE_TIMEOUT_SECS: u64 = 600;     // 10 phút idle timeout
+const DB_MAX_LIFETIME_SECS: u64 = 3600;    // 1 giờ max lifetime
+
 use thiserror::Error;
 
 use crate::{

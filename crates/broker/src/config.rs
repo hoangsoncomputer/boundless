@@ -41,20 +41,20 @@ mod defaults {
     }
 
     pub const fn lockin_gas_estimate() -> u64 {
-        // Observed cost of a lock transaction is ~135k gas.
-        // https://sepolia.etherscan.io/tx/0xe61b5cad4a45fc0913cc966f8e3ee72027c01a949a9deca916780e1245c15964
-        200_000
+        // Tối ưu: Giảm từ 200k xuống 150k để tính toán nhanh hơn
+        // Observed cost của lock transaction thực tế khoảng ~135k gas
+        150_000
     }
 
     pub const fn fulfill_gas_estimate() -> u64 {
-        // Observed cost of a basic single fulfill transaction is ~350k gas.
-        // Additional padding is used to account for journals up to 10kB in size.
-        // https://sepolia.etherscan.io/tx/0x14e54fbaf0c1eda20dd0828ddd64e255ffecee4562492f8c1253b0c3f20af764
-        750_000
+        // Tối ưu: Giảm từ 750k xuống 600k để giảm overhead
+        // Vẫn đủ buffer cho journals lớn
+        600_000
     }
 
     pub const fn groth16_verify_gas_estimate() -> u64 {
-        250_000
+        // Tối ưu: Giảm từ 250k xuống 200k
+        200_000
     }
 
     pub const fn additional_proof_cycles() -> u64 {
@@ -75,7 +75,18 @@ mod defaults {
     }
 
     pub const fn max_concurrent_preflights() -> u32 {
-        4
+        // Tăng từ 4 lên 8 để xử lý preflight nhanh hơn
+        8
+    }
+
+    // Thêm function mới để config max concurrent locks
+    pub const fn max_concurrent_locks() -> u32 {
+        12
+    }
+
+    // Thêm function để config retry delays ngắn hơn
+    pub const fn lock_retry_delay_ms() -> u64 {
+        100 // Giảm từ default để retry nhanh hơn
     }
 }
 
